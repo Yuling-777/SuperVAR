@@ -64,3 +64,26 @@ class ImagePatchDataset(Dataset):
         patch_pil = Image.fromarray(patch_np)
         patch_tensor = self.transform(patch_pil).to(self.device)  # apply ToTensor + normalize
         return patch_tensor
+
+
+
+class PreCroppedPatchDataset(Dataset):
+    def __init__(self, folder_path, device='cpu'):
+        self.folder_path = folder_path
+        self.device = device
+        self.image_files = [os.path.join(folder_path, f) for f in os.listdir(folder_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+
+        self.transform = transforms.Compose([
+            transforms.CenterCrop(256),
+            transforms.ToTensor(),       # [0, 255] → [0, 1]
+            normalize_01_into_pm1        # [0, 1] → [-1, 1]
+        ])
+
+    def __len__(self):
+        return len(self.image_files)
+
+    def __getitem__(self, idx):
+        img_path = self.image_files[idx]
+        img = Image.open(img_path).convert('RGB')
+        tensor = self.transform(img).to(self.device)
+        return tensor
