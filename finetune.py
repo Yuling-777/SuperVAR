@@ -1,18 +1,4 @@
-import os
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
-from torchvision.transforms.functional import resize
-from PIL import Image
-import glob
-import random
 
-# === VQVAE, VAR assumed to be already built and loaded (as in your code) ===
-# vae, var = build_vae_var(...)
-# vae.load_state_dict(...)
-# var.load_state_dict(...)
 ################## 1. Download checkpoints and build models
 import os
 if os.path.exists('/content/VAR'): os.chdir('/content/VAR')
@@ -24,6 +10,110 @@ import PIL.Image as PImage, PIL.ImageDraw as PImageDraw
 setattr(torch.nn.Linear, 'reset_parameters', lambda self: None)     # disable default parameter init for faster speed
 setattr(torch.nn.LayerNorm, 'reset_parameters', lambda self: None)  # disable default parameter init for faster speed
 from models import VQVAE, build_vae_var
+from tqdm import tqdm
+from torch.utils.data import DataLoader
+import torch.nn.functional as F
+from Datapreprocessing import ImagePatchDataset
+
+################## 2. Define some helper functions for zero-shot editing
+
+from typing import List, Optional, Union
+
+import torch
+import torch.nn.functional as F
+from models.var import AdaLNSelfAttn, sample_with_top_k_top_p_, gumbel_softmax_with_rng
+
+
+def get_edit_mask(patch_nums: List[int], y0: float, x0: float, y1: float, x1: float, device, inpainting: bool = True) -> torch.Tensor:
+    ph, pw = patch_nums[-1], patch_nums[-1]
+    edit_mask = torch.zeros(ph, pw, device=device)
+    edit_mask[round(y0 * ph):round(y1 * ph), round(x0 * pw):round(x1 * pw)] = 1 # outpainting mode: center would be gt
+    if inpainting:
+        edit_mask = 1 - edit_mask   # inpainting mode: center would be model pred
+    return edit_mask    # a binary mask, 1 for keeping the tokens of the image to be edited; 0 for generating new tokens (by VAR)
+
+# overwrite the function of 'VAR::autoregressive_infer_cfg'
+def autoregressive_infer_cfg_with_mask(
+    self, B: int, label_B: Optional[Union[int, torch.LongTensor]],
+    g_seed: Optional[int] = None, cfg=1.5, top_k=0, top_p=0.0,
+    more_smooth=False,
+    input_img_tokens: Optional[List[torch.Tensor]] = None, edit_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:   # returns reconstructed image (B, 3, H, W) in [0, 1]
+    """
+    only used for inference, on autoregressive mode
+    :param B: batch size
+    :param label_B: imagenet label; if None, randomly sampled
+    :param g_seed: random seed
+    :param cfg: classifier-free guidance ratio
+    :param top_k: top-k sampling
+    :param top_p: top-p sampling
+    :param more_smooth: smoothing the pred using gumbel softmax; only used in visualization, not used in FID/IS benchmarking
+    :param input_img_tokens: (optional, only for zero-shot edit tasks) tokens of the image to be edited
+    :param edit_mask: (optional, only for zero-shot edit tasks) binary mask, 1 for keeping given tokens; 0 for generating new tokens
+    :return: if returns_vemb: list of embedding h_BChw := vae_embed(idx_Bl), else: list of idx_Bl
+    """
+    if g_seed is None: rng = None
+    else: self.rng.manual_seed(g_seed); rng = self.rng
+
+    if label_B is None:
+        label_B = torch.multinomial(self.uniform_prob, num_samples=B, replacement=True, generator=rng).reshape(B)
+    elif isinstance(label_B, int):
+        label_B = torch.full((B,), fill_value=self.num_classes if label_B < 0 else label_B, device=self.lvl_1L.device)
+
+    sos = cond_BD = self.class_emb(torch.cat((label_B, torch.full_like(label_B, fill_value=self.num_classes)), dim=0))
+
+    lvl_pos = self.lvl_embed(self.lvl_1L) + self.pos_1LC
+
+    next_token_map = sos.unsqueeze(1).expand(2 * B, self.first_l, -1) + self.pos_start.expand(2 * B, self.first_l, -1) + lvl_pos[:, :self.first_l]
+
+    cur_L = 0
+    f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
+
+    for b in self.blocks: b.attn.kv_caching(True)
+    for si, pn in enumerate(self.patch_nums):   # si: i-th segment
+        ratio = si / self.num_stages_minus_1
+        # last_L = cur_L
+        cur_L += pn*pn
+        # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
+        cond_BD_or_gss = self.shared_ada_lin(cond_BD)
+        x = next_token_map
+        AdaLNSelfAttn.forward
+        for b in self.blocks:
+            x = b(x=x, cond_BD=cond_BD_or_gss, attn_bias=None)
+        logits_BlV = self.get_logits(x, cond_BD)
+
+        t = cfg * ratio
+        logits_BlV = (1+t) * logits_BlV[:B] - t * logits_BlV[B:]
+
+        idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
+        if not more_smooth: # this is the default case
+            h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl)   # B, l, Cvae
+        else:   # not used when evaluating FID/IS/Precision/Recall
+            gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)   # refer to mask-git
+            h_BChw = gumbel_softmax_with_rng(logits_BlV.mul(1 + ratio), tau=gum_t, hard=False, dim=-1, rng=rng) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
+
+        h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.Cvae, pn, pn)
+        # if edit_mask is not None:
+        gt_BChw = self.vae_quant_proxy[0].embedding(input_img_tokens[si]).transpose_(1, 2).reshape(B, self.Cvae, pn, pn)
+       
+        h_BChw = combine_embedding(h_BChw, gt_BChw, ph=pn, pw=pn)   # TODO: =====> please specify the ratio <=====
+
+        f_hat, next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(si, len(self.patch_nums), f_hat, h_BChw)
+        if si != self.num_stages_minus_1:   # prepare for next stage
+            next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)
+            next_token_map = self.word_embed(next_token_map) + lvl_pos[:, cur_L:cur_L + self.patch_nums[si+1] ** 2]
+            next_token_map = next_token_map.repeat(2, 1, 1)   # double the batch sizes due to CFG
+      
+    for b in self.blocks: b.attn.kv_caching(False)
+    return self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)
+
+def combine_embedding(h_BChw: torch.Tensor, gt_BChw: torch.Tensor, ph: int, pw:int) -> torch.Tensor:
+    B = h_BChw.shape[0]
+    ratio = 0.2
+    return h_BChw * ratio + gt_BChw * (1 - ratio)   # TODO: =====> please specify the ratio <=====
+
+
+
 
 # we recommend using imagenet-512-d36 model to do the in-painting & out-painting & class-condition editing task
 MODEL_DEPTH = 36    # TODO: =====> please specify MODEL_DEPTH <=====
@@ -32,10 +122,10 @@ assert MODEL_DEPTH in {16, 20, 24, 30, 36}
 
 
 # download checkpoint
-# hf_home = 'https://huggingface.co/FoundationVision/var/resolve/main'
+hf_home = 'https://huggingface.co/FoundationVision/var/resolve/main'
 vae_ckpt, var_ckpt = './model_path/var/vae_ch160v4096z32.pth', f'./model_path/var/var_d{MODEL_DEPTH}.pth'
-# if not osp.exists(vae_ckpt): os.system(f'wget {hf_home}/{vae_ckpt}')
-# if not osp.exists(var_ckpt): os.system(f'wget {hf_home}/{var_ckpt}')
+if not osp.exists(vae_ckpt): os.system(f'wget {hf_home}/{vae_ckpt}')
+if not osp.exists(var_ckpt): os.system(f'wget {hf_home}/{var_ckpt}')
 
 # build vae, var
 FOR_512_px = MODEL_DEPTH == 36
@@ -51,110 +141,59 @@ vae, var = build_vae_var(
 )
 
 # load checkpoints
-vae.load_state_dict(torch.load(vae_ckpt, map_location='cpu'), strict=True)
-var.load_state_dict(torch.load(var_ckpt, map_location='cpu'), strict=True)
-print(f'preparation finished.')
+# vae.load_state_dict(torch.load(vae_ckpt, map_location='cpu'), strict=True)
+# var.load_state_dict(torch.load(var_ckpt, map_location='cpu'), strict=True)
 
-# === Flickr2K dataset loader with patch cropping ===
-class Flickr2KSRDataset(Dataset):
-    def __init__(self, root_dir, scale=2, patch_size=512, stride=256):
-        self.hr_paths = sorted(glob.glob(os.path.join(root_dir, '*.png')))
-        self.scale = scale
-        self.patch_size = patch_size
-        self.stride = stride
-        self.to_tensor = transforms.ToTensor()
-        self.patch_coords = self._build_patch_index()
+vae.eval()
+for p in vae.parameters():
+    p.requires_grad = False  # freeze VAE
 
-    def _build_patch_index(self):
-        patch_list = []
-        for img_path in self.hr_paths:
-            img = Image.open(img_path).convert('RGB')
-            w, h = img.size
-            for top in range(0, h - self.patch_size + 1, self.stride):
-                for left in range(0, w - self.patch_size + 1, self.stride):
-                    patch_list.append((img_path, left, top))
-        return patch_list
+var.train()
 
+# ========= Step 2: Optimizer ============
+optimizer = torch.optim.AdamW(var.parameters(), lr=1e-4, weight_decay=0.01)
 
-    def __len__(self):
-        return len(self.patch_coords)
+# ========= Step 3: Dataloader ============
+dataset = ImagePatchDataset(folder_path='./data/test', patch_size=512)
+train_loader = DataLoader(dataset, batch_size=4, shuffle=True)
 
-    def __getitem__(self, idx):
-        path, left, top = self.patch_coords[idx]
-        hr_img = Image.open(path).convert('RGB')
-        hr_patch = hr_img.crop((left, top, left + self.patch_size, top + self.patch_size))
+# ========= Step 4: Training Loop ============
+num_epochs = 10
+loss_fn = torch.nn.L1Loss()
 
-        lr_patch = hr_patch.resize((self.patch_size // self.scale, self.patch_size // self.scale), Image.BICUBIC)
-        lr_patch_up = lr_patch.resize((self.patch_size, self.patch_size), Image.BICUBIC)
+for epoch in range(num_epochs):
+    pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
+    for img in pbar:
+        hr_img = img.to(device)
 
-        return self.to_tensor(lr_patch_up), self.to_tensor(hr_patch)
+        # Step 1: downsample input img (if needed)
+        lr_img = F.interpolate(img, size=(256, 256), mode='bicubic')
+        lr_img = F.interpolate(lr_img, size=(512, 512), mode='bicubic')
 
-# === Loss: token-level prediction ===
-def token_level_loss(pred_logits, target_idx):
-    pred = pred_logits.reshape(-1, pred_logits.size(-1))
-    target = target_idx.view(-1)
-    return nn.CrossEntropyLoss()(pred, target)
+        # Step 2: convert image to token list
+        with torch.no_grad():
+            ms_idxBl = vae.img_to_idxBl(lr_img)  # List of token sequences for each scale
 
-# === Forward method with no class condition ===
-def forward_autoregressive_teacher_forcing_no_class(var_model, input_tokens):
-    B = input_tokens[-1].size(0)
-    f_hat = torch.zeros(B, var_model.Cvae, var_model.patch_nums[-1], var_model.patch_nums[-1], device=input_tokens[-1].device)
+        # Step 3: generate embeddings autoregressively (simulate inference)
+        B = hr_img.shape[0]
+        label_B = torch.full((B,), 1000, device=device, dtype=torch.long) 
+        with torch.cuda.amp.autocast(dtype=torch.float16):
+            # similar to autoregressive_infer_cfg
+            pred_imgs = autoregressive_infer_cfg_with_mask(
+                var,
+                B=B, label_B=label_B, cfg=3, top_k=900, top_p=0.95, g_seed=0, more_smooth=True,
+                input_img_tokens=ms_idxBl
+            )
 
-    cur_L = 0
-    logits = None
-    for si, pn in enumerate(var_model.patch_nums):
-        lvl_pos = var_model.lvl_embed(var_model.lvl_1L) + var_model.pos_1LC
-        token_map = input_tokens[si].view(B, pn * pn).long()
-        x = var_model.word_embed(var_model.vae_quant_proxy[0].embedding(token_map)).view(B, pn * pn, -1)
-        x = x + lvl_pos[:, cur_L:cur_L + pn * pn]
+            # Step 4: calculate loss
+            loss = loss_fn(pred_imgs, hr_img)
 
-        cond_BD = torch.zeros(B, var_model.class_emb.embedding_dim, device=x.device)  # no class condition
-        cond_BD = var_model.shared_ada_lin(cond_BD)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
 
-        for blk in var_model.blocks:
-            x = blk(x=x, cond_BD=cond_BD, attn_bias=None)
+        pbar.set_postfix({"loss": loss.item()})
 
-        logits = var_model.get_logits(x, cond_BD)  # overwrite until last stage
-        cur_L += pn * pn
-
-    return logits  # logits from final stage only
-
-# === Training loop ===
-from tqdm import tqdm
-
-def train_var_for_sr(var, vae, dataloader, device='cuda', epochs=10, lr=1e-4):
-    var.train()
-    for p in vae.parameters():
-        p.requires_grad_(False)
-
-    optimizer = optim.Adam(var.parameters(), lr=lr)
-
-    for epoch in range(epochs):
-        print(f"[Epoch {epoch+1}/{epochs}]")
-        total_loss = 0
-        for i, (lr_img, hr_img) in enumerate(tqdm(dataloader, desc=f"Training", leave=False)):
-            lr_img = lr_img.to(device)
-            hr_img = hr_img.to(device)
-
-            with torch.no_grad():
-                input_tokens = vae.img_to_idxBl(lr_img, var.patch_nums)
-                target_tokens = vae.img_to_idxBl(hr_img, var.patch_nums)
-
-            pred_logits = forward_autoregressive_teacher_forcing_no_class(var, input_tokens)
-            loss = token_level_loss(pred_logits, target_tokens[-1])  # Only fine-tune final stage (32x32)
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            total_loss += loss.item()
-            if i % 10 == 0:
-                print(f"Epoch [{epoch+1}/{epochs}] Step [{i+1}/{len(dataloader)}] Loss: {loss.item():.4f}")
-
-        print(f"Epoch [{epoch+1}] Average Loss: {total_loss / len(dataloader):.4f}")
-
-
-# === Usage Example ===
-dataset = Flickr2KSRDataset(root_dir='./data/Flickr2K', scale=2, patch_size=512, stride=256)
-dataloader = DataLoader(dataset, batch_size=4, shuffle=True, num_workers=4)
-train_var_for_sr(var, vae, dataloader, device='cuda', epochs=5)
+# ========= Optional: Save ============
+os.makedirs('checkpoints', exist_ok=True)
+torch.save(var.state_dict(), 'checkpoints/var_finetuned.pth')
