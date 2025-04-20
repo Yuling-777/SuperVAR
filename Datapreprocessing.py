@@ -74,7 +74,7 @@ class PreCroppedPatchDataset(Dataset):
         self.image_files = [os.path.join(folder_path, f) for f in os.listdir(folder_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
 
         self.transform = transforms.Compose([
-            transforms.CenterCrop(256),
+            transforms.CenterCrop(512),
             transforms.ToTensor(),       # [0, 255] → [0, 1]
             normalize_01_into_pm1        # [0, 1] → [-1, 1]
         ])

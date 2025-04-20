@@ -116,7 +116,7 @@ def combine_embedding(h_BChw: torch.Tensor, gt_BChw: torch.Tensor, ph: int, pw:i
 
 
 # we recommend using imagenet-512-d36 model to do the in-painting & out-painting & class-condition editing task
-MODEL_DEPTH = 24    # TODO: =====> please specify MODEL_DEPTH <=====
+MODEL_DEPTH = 16    # TODO: =====> please specify MODEL_DEPTH <=====
 
 assert MODEL_DEPTH in {16, 20, 24, 30, 36}
 
@@ -140,17 +140,15 @@ vae, var = build_vae_var(
     device=device, patch_nums=patch_nums,
     num_classes=1000, depth=MODEL_DEPTH, shared_aln=False,
 )
-vae
-var.to(device)
 # load checkpoints
-# vae.load_state_dict(torch.load(vae_ckpt, map_location='cpu'), strict=True)
-# var.load_state_dict(torch.load(var_ckpt, map_location='cpu'), strict=True)
+vae.load_state_dict(torch.load(vae_ckpt, map_location='cpu'), strict=True)
+var.load_state_dict(torch.load(var_ckpt, map_location='cpu'), strict=True)
 
 vae.eval()
 for p in vae.parameters():
     p.requires_grad = False  # freeze VAE
-
-var.train()
+vae.to(device)
+var.train().to(device)  
 
 # ========= Step 2: Optimizer ============
 optimizer = torch.optim.AdamW(var.parameters(), lr=1e-4, weight_decay=0.01)
@@ -172,11 +170,10 @@ for epoch in range(num_epochs):
         # Step 1: downsample input img (if needed)
         lr_img = F.interpolate(img, size=(128, 128), mode='bicubic')
         lr_img = F.interpolate(lr_img, size=(256, 256), mode='bicubic')
-        lr_img = lr_img.to(device)
-
+        lr_img_cpu = lr_img.to(device)
         # Step 2: convert image to token list
-        ms_idxBl = vae.img_to_idxBl(lr_img)  # List of token sequences for each scale
-
+        ms_idxBl = vae.img_to_idxBl(lr_img_cpu)  # List of token sequences for each scale
+        ms_idxBl = [x.to(device) for x in ms_idxBl]
         # Step 3: generate embeddings autoregressively (simulate inference)
         B = hr_img.shape[0]
         label_B = torch.full((B,), 1000, device=device, dtype=torch.long) 
